@@ -55,6 +55,25 @@ command exits or is interrupted
 is designed for OVN-Kubernetes Interconnect (IC) clusters, in which every node
 maintains its own Northbound and Southbound database. Each database pair
 therefore describes a single node.
+.SH PREREQUISITES
+.B ovn-analyzer
+is a wrapper and does not bundle any OVN binaries. The following host tools must
+be installed and present on
+.B PATH
+before use:
+.BR ovsdb-server (1),
+.BR ovsdb-tool (1),
+.BR ovs-appctl (8),
+.BR ovn-nbctl (8),
+.BR ovn-sbctl (8),
+and
+.BR ovn-trace (8).
+On RHEL, Fedora, or CentOS Stream install them with
+.RB \(dq "dnf install openvswitch ovn ovn-central" \(dq;
+on Debian or Ubuntu use
+.RB \(dq "apt-get install openvswitch-common ovn-common ovn-central" \(dq.
+If any required binary is missing the tool exits with status
+.BR 127 .
 .SH REQUIRED ARGUMENTS
 .TP
 .BI \-\-nb " path"

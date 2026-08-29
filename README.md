@@ -12,6 +12,23 @@ live cluster, no container runtime, and no network daemons** required.
 Built for OVN-Kubernetes **Interconnect (IC)** clusters (OCP 4.14+), where each
 `ovnkube-node` pod has its own per-node Northbound and Southbound database.
 
+> ## ⚠️ Prerequisite — OVN/OVS packages are REQUIRED
+>
+> `ovn-analyzer` is a wrapper: it does **not** bundle any OVN binaries. Before
+> using it you **must install** the host packages that provide `ovsdb-server`,
+> `ovsdb-tool`, `ovs-appctl`, `ovn-nbctl`, `ovn-sbctl`, and `ovn-trace`:
+>
+> ```bash
+> # RHEL / Fedora / CentOS Stream
+> sudo dnf install -y openvswitch ovn ovn-central
+>
+> # Debian / Ubuntu
+> sudo apt-get install -y openvswitch-common ovn-common ovn-central
+> ```
+>
+> Without these packages the tool cannot run — it will exit with an error
+> listing the missing binaries. See [Requirements](#requirements) for details.
+
 ## Features
 
 - **`nbctl` / `sbctl`** — run any `ovn-nbctl` / `ovn-sbctl` command against the
@@ -35,8 +52,21 @@ Built for OVN-Kubernetes **Interconnect (IC)** clusters (OCP 4.14+), where each
 
 ## Requirements
 
-Host packages that provide `ovsdb-server`, `ovsdb-tool`, `ovs-appctl`,
-`ovn-nbctl`, `ovn-sbctl`, and `ovn-trace`:
+**Package installation is required.** `ovn-analyzer` shells out to the standard
+OVN/OVS command-line tools and will not work unless they are installed on the
+host first. It runs a preflight check and exits with code `127` if any of these
+binaries are missing:
+
+| Binary          | Provided by (RPM)   | Provided by (deb)         |
+|-----------------|---------------------|---------------------------|
+| `ovsdb-server`  | `openvswitch`       | `openvswitch-common`      |
+| `ovsdb-tool`    | `openvswitch`       | `openvswitch-common`      |
+| `ovs-appctl`    | `openvswitch`       | `openvswitch-common`      |
+| `ovn-nbctl`     | `ovn` / `ovn-central` | `ovn-common` / `ovn-central` |
+| `ovn-sbctl`     | `ovn` / `ovn-central` | `ovn-common` / `ovn-central` |
+| `ovn-trace`     | `ovn` / `ovn-central` | `ovn-common` / `ovn-central` |
+
+Install them before running the tool:
 
 ```bash
 # RHEL / Fedora / CentOS Stream
@@ -44,6 +74,14 @@ sudo dnf install -y openvswitch ovn ovn-central
 
 # Debian / Ubuntu
 sudo apt-get install -y openvswitch-common ovn-common ovn-central
+```
+
+Verify they are on `PATH`:
+
+```bash
+for b in ovsdb-server ovsdb-tool ovs-appctl ovn-nbctl ovn-sbctl ovn-trace; do
+  command -v "$b" || echo "MISSING: $b"
+done
 ```
 
 > Match the host OVN version to the cluster's OVN version where possible. A host

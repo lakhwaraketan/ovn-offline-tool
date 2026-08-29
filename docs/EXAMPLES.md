@@ -1,5 +1,12 @@
 # Sample commands
 
+> **Prerequisite — install the OVN/OVS packages first.** `ovn-analyzer` wraps the
+> standard OVN client tools; it does not bundle them. Install
+> `openvswitch ovn ovn-central` (RPM) or `openvswitch-common ovn-common ovn-central`
+> (deb) before running any command below, or the tool exits with code `127`
+> listing the missing binaries. See the [Requirements](../README.md#requirements)
+> section for the full list.
+
 All examples assume two extracted database files in the current directory:
 
 ```
