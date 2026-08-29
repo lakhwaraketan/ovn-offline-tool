@@ -1,0 +1,14 @@
+# Never commit extracted OVN databases — they contain cluster data
+*.db
+.db
+
+# Local dump/compare output
+ovn-dump-*/
+dump-*/
+dumpA/
+dumpB/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

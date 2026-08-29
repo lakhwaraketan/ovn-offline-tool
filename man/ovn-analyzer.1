@@ -1,0 +1,260 @@
+.\" Manpage for ovn-analyzer.
+.TH OVN-ANALYZER 1 "2026-08-29" "ovn-offline-tool" "User Commands"
+.SH NAME
+ovn-analyzer \- offline, host-native inspector for extracted OVN databases
+.SH SYNOPSIS
+.B ovn-analyzer
+.BI \-\-nb " ovnnb_db.db"
+.BI \-\-sb " ovnsb_db.db"
+.RI [ options ]
+.I command
+.RI [ args ...]
+.br
+.B ovn-analyzer
+.B compare
+.I dumpdirA dumpdirB
+.br
+.B ovn-analyzer
+.B \-\-help
+.SH DESCRIPTION
+.B ovn-analyzer
+serves OVN Northbound and Southbound database files that were extracted from a
+cluster (typically from the
+.B ovnkube-node
+pods of an OpenShift / Kubernetes cluster) and runs the standard OVN client
+tools against them entirely offline.
+.PP
+On each invocation it creates a private temporary directory under
+.IR /tmp ,
+copies the supplied database files into it, starts one detached
+.BR ovsdb-server (1)
+per database on a unique Unix domain socket, and exports
+.B OVN_NB_DB
+and
+.B OVN_SB_DB
+so that
+.BR ovn-nbctl (8),
+.BR ovn-sbctl (8),
+and
+.BR ovn-trace (8)
+operate against the offline copies. Clustered (Raft) databases are converted to
+standalone automatically with
+.BR "ovsdb-tool cluster-to-standalone" .
+The original files are never modified.
+.PP
+All transient servers and temporary files are removed automatically when the
+command exits or is interrupted
+.RB ( EXIT ,
+.BR SIGINT ,
+.BR SIGTERM ,
+.BR SIGHUP ,
+.BR SIGPIPE ,
+.BR SIGQUIT ).
+.PP
+.B ovn-analyzer
+is designed for OVN-Kubernetes Interconnect (IC) clusters, in which every node
+maintains its own Northbound and Southbound database. Each database pair
+therefore describes a single node.
+.SH REQUIRED ARGUMENTS
+.TP
+.BI \-\-nb " path"
+Path to the extracted OVN Northbound database file. Required for all commands
+except
+.BR compare .
+.TP
+.BI \-\-sb " path"
+Path to the extracted OVN Southbound database file. Required for all commands
+except
+.BR compare .
+.SH OPTIONS
+.TP
+.B \-\-keep
+Do not delete the
+.I /tmp
+runtime directory on exit. Useful for debugging the transient servers.
+.TP
+.B \-\-force
+Run the requested command even if the NB/SB pairing checklist (see
+.BR check )
+fails.
+.TP
+.BR \-v ", " \-\-verbose
+Print verbose diagnostics to standard error.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.SH COMMANDS
+.TP
+.BI "nbctl " "args..."
+Run
+.BR ovn-nbctl (8)
+against the Northbound database. Any
+.B ovn-nbctl
+sub-command is accepted, for example
+.BR show ,
+.BR "list " \fItable\fR,
+.BR "find " \fItable\ column=value\fR.
+.TP
+.BI "sbctl " "args..."
+Run
+.BR ovn-sbctl (8)
+against the Southbound database, for example
+.BR show ,
+.BR lflow-list ,
+.BR "list Chassis" .
+.TP
+.BI "trace " "args..."
+Run
+.BR ovn-trace (8)
+against the Southbound database to perform an offline packet trace, for example
+.RB \(dq "trace \-\-detailed " \fIdatapath\fR " '" \fImicroflow\fR "'" \(dq.
+.TP
+.BI "appctl " "nb|sb args..."
+Run
+.BR ovs-appctl (8)
+against the control (unixctl) socket of the Northbound or Southbound transient
+server, for example
+.RB \(dq "appctl nb memory/show" \(dq
+or
+.RB \(dq "appctl sb ovsdb-server/list-dbs" \(dq.
+.TP
+.B check
+Run only the NB/SB pairing checklist and exit. Verifies that
+.B \-\-nb
+is an
+.B OVN_Northbound
+database, that
+.B \-\-sb
+is an
+.B OVN_Southbound
+database, and that both belong to the same node (compared via
+.B NB_Global.options:name
+and
+.BR SB_Global.options:name ).
+Exits non-zero on any mismatch.
+.TP
+.BI "dump " "[OUTDIR]"
+Snapshot the node's Northbound and Southbound databases into normalized,
+UUID-scrubbed, sorted files suitable for stable diffing. The default
+.I OUTDIR
+is
+.IB ./ovn-dump- <node-label>\fR.
+.TP
+.BI "compare " "dumpdirA dumpdirB"
+Diff two directories produced by
+.BR dump .
+This command is fully offline and needs neither
+.B \-\-nb
+nor
+.BR \-\-sb .
+Differences in tables that OVN-Kubernetes keeps identical across every IC node
+.RB ( Address_Set ,
+.BR Port_Group ,
+.BR Chassis )
+are reported as drift; per-node differences are reported as expected.
+.TP
+.B interactive
+Spawn a subshell in which
+.BR OVN_NB_DB ,
+.BR OVN_SB_DB ,
+.BR OVN_NB_CTL ,
+and
+.B OVN_SB_CTL
+are pre-exported, along with the
+.BR nbctl ,
+.BR sbctl ,
+.BR trace ,
+.BR appctl-nb ,
+and
+.B appctl-sb
+aliases. Exit the subshell to tear down the transient servers.
+.SH ENVIRONMENT
+.TP
+.B OVN_NB_DB
+Set by the tool to the Northbound transient server socket
+.RB ( "unix:" ...).
+.TP
+.B OVN_SB_DB
+Set by the tool to the Southbound transient server socket.
+.TP
+.B OVN_NB_CTL
+.TQ
+.B OVN_SB_CTL
+Exported in
+.B interactive
+mode; paths to the Northbound / Southbound control (unixctl) sockets.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or a consistent result from
+.B check
+/
+.BR compare .
+.TP
+.B 1
+General error, or a failed pairing checklist.
+.TP
+.B 2
+.B compare
+detected drift in an invariant (cluster-synced) table.
+.TP
+.B 127
+A required OVN binary was not found on the host.
+.SH FILES
+.TP
+.I /tmp/ovn-analyzer.XXXXXX
+Per-invocation runtime directory holding the served database copies, Unix
+sockets, pidfiles, and server logs. Removed on exit unless
+.B \-\-keep
+is given.
+.SH EXAMPLES
+.PP
+Verify a pair belongs to the same node:
+.PP
+.RS
+.EX
+ovn-analyzer \-\-nb node_ovnnb_db.db \-\-sb node_ovnsb_db.db check
+.EE
+.RE
+.PP
+Show the Northbound topology and the compiled Southbound flows:
+.PP
+.RS
+.EX
+ovn-analyzer \-\-nb node_ovnnb_db.db \-\-sb node_ovnsb_db.db nbctl show
+ovn-analyzer \-\-nb node_ovnnb_db.db \-\-sb node_ovnsb_db.db sbctl lflow-list
+.EE
+.RE
+.PP
+Trace a broadcast packet:
+.PP
+.RS
+.EX
+ovn-analyzer \-\-nb node_ovnnb_db.db \-\-sb node_ovnsb_db.db \e
+    trace \-\-detailed ls1 'inport=="vm1" && eth.dst==ff:ff:ff:ff:ff:ff'
+.EE
+.RE
+.PP
+Dump two nodes and compare them:
+.PP
+.RS
+.EX
+ovn-analyzer \-\-nb a_ovnnb_db.db \-\-sb a_ovnsb_db.db dump ./dumpA
+ovn-analyzer \-\-nb b_ovnnb_db.db \-\-sb b_ovnsb_db.db dump ./dumpB
+ovn-analyzer compare ./dumpA ./dumpB
+.EE
+.RE
+.SH SEE ALSO
+.BR ovn-nbctl (8),
+.BR ovn-sbctl (8),
+.BR ovn-trace (8),
+.BR ovsdb-server (1),
+.BR ovsdb-tool (1),
+.BR ovs-appctl (8)
+.SH NOTES
+The host OVN client version should match the cluster's OVN version where
+possible. A host client older than the captured database schema may print a
+harmless warning about a missing column (for example
+.IR "lacks nb_uuid column" ).
+.SH AUTHOR
+Ketan Lakhwara.

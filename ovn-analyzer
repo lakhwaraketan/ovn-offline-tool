@@ -1,0 +1,679 @@
+#!/usr/bin/env bash
+#
+# ovn-analyzer — offline, host-native OVN Northbound/Southbound DB inspector
+# ---------------------------------------------------------------------------
+# Serves extracted OVN Raft/standalone database files locally via transient
+# ovsdb-server processes, then wraps ovn-nbctl / ovn-sbctl / ovn-trace and an
+# interactive subshell against them.
+#
+# NO container runtime, NO live cluster, NO network daemons required.
+#
+#   ./ovn-analyzer --nb <ovnnb_db.db> --sb <ovnsb_db.db> <command> [args...]
+#
+# Commands:
+#   nbctl [args...]     Run ovn-nbctl against the NB DB   (show|list|find|...)
+#   sbctl [args...]     Run ovn-sbctl against the SB DB   (show|lflow-list|...)
+#   trace [args...]     Run ovn-trace against the SB DB   (<datapath> <microflow>)
+#   interactive         Spawn a subshell with OVN_NB_DB/OVN_SB_DB pre-exported
+#   raw-nb [args...]    Run ovsdb-client/ovn-nbctl-free raw query on NB socket
+#
+# See --help for full usage.
+# ---------------------------------------------------------------------------
+
+set -Eeuo pipefail
+
+PROG="$(basename "$0")"
+
+# --- global state (populated at runtime) -----------------------------------
+NB_DB=""            # user-supplied NB db file
+SB_DB=""            # user-supplied SB db file
+RUNDIR=""           # transient /tmp working directory
+KEEP_RUNDIR=0       # --keep : do not delete RUNDIR on exit
+FORCE=0             # --force : run even if the NB/SB pairing checklist fails
+VERBOSE=0
+declare -a SERVER_PIDS=()   # tracked ovsdb-server PIDs for cleanup
+
+NB_SOCK=""          # OVSDB (JSON-RPC) unix socket for NB ovsdb-server
+SB_SOCK=""          # OVSDB (JSON-RPC) unix socket for SB ovsdb-server
+NB_CTL=""           # unixctl (ovs-appctl) control socket for NB server
+SB_CTL=""           # unixctl (ovs-appctl) control socket for SB server
+
+# ---------------------------------------------------------------------------
+# Logging helpers (all diagnostics to stderr so stdout stays pipe-clean)
+# ---------------------------------------------------------------------------
+log()  { printf '[%s] %s\n'  "$PROG" "$*" >&2; }
+vlog() { [ "$VERBOSE" -eq 1 ] && printf '[%s] %s\n' "$PROG" "$*" >&2 || true; }
+err()  { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Cleanup — guaranteed teardown of every background server and temp artifact.
+# Installed as an EXIT/SIGINT/SIGTERM/SIGHUP trap.
+# ---------------------------------------------------------------------------
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP PIPE QUIT   # disarm to avoid recursion
+
+    # Terminate any ovsdb-server we started (graceful, then forced).
+    local pid
+    for pid in "${SERVER_PIDS[@]:-}"; do
+        [ -n "$pid" ] || continue
+        if kill -0 "$pid" 2>/dev/null; then
+            vlog "stopping ovsdb-server pid=$pid"
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+    # Give them a moment, then SIGKILL stragglers.
+    local waited=0
+    while [ "$waited" -lt 20 ]; do
+        local alive=0
+        for pid in "${SERVER_PIDS[@]:-}"; do
+            [ -n "$pid" ] || continue
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && break
+        sleep 0.1; waited=$((waited + 1))
+    done
+    for pid in "${SERVER_PIDS[@]:-}"; do
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    done
+
+    # Remove the transient runtime directory (sockets, pidfiles, db copies).
+    if [ -n "$RUNDIR" ] && [ -d "$RUNDIR" ]; then
+        if [ "$KEEP_RUNDIR" -eq 1 ]; then
+            log "runtime dir preserved (--keep): $RUNDIR"
+        else
+            rm -rf -- "$RUNDIR"
+            vlog "removed runtime dir: $RUNDIR"
+        fi
+    fi
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat >&2 <<EOF
+$PROG — offline host-native OVN NB/SB database analyzer
+
+USAGE:
+  $PROG --nb <ovnnb_db.db> --sb <ovnsb_db.db> [options] <command> [args...]
+
+REQUIRED:
+  --nb <path>    Path to the extracted OVN Northbound database file
+  --sb <path>    Path to the extracted OVN Southbound database file
+
+OPTIONS:
+  --keep         Do not delete the /tmp runtime directory on exit (debug)
+  --force        Run even if the NB/SB pairing checklist fails (see 'check')
+  -v, --verbose  Verbose diagnostics to stderr
+  -h, --help     Show this help
+
+COMMANDS:
+  nbctl [args...]      ovn-nbctl against NB (show | list <tbl> | find <tbl> ...)
+  sbctl [args...]      ovn-sbctl against SB (show | lflow-list | list Chassis ...)
+  trace [args...]      ovn-trace against SB (<datapath> '<microflow>' [--detailed])
+  appctl <nb|sb> ...   ovs-appctl against the NB or SB server's control socket
+                       (e.g. appctl nb memory/show | appctl sb ovsdb-server/list-dbs)
+  check                run only the NB/SB pairing checklist and exit (verifies
+                       both files are the right schema and from the SAME node)
+  dump [OUTDIR]        snapshot this node's NB/SB into normalized diff-ready files
+                       (default OUTDIR: ./ovn-dump-<node-label>)
+  compare <dirA> <dirB>  side-by-side IC diff of two dumps; flags drift in
+                         cluster-synced tables. Offline — no --nb/--sb needed.
+  interactive          subshell with OVN_NB_DB / OVN_SB_DB pre-exported
+
+EXAMPLES:
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db nbctl show
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db nbctl list Logical_Switch
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db nbctl find ACL direction=to-lport
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db sbctl show
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db sbctl lflow-list
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db sbctl list Chassis
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db \\
+        trace --detailed ls1 'inport=="vm1" && eth.dst==ff:ff:ff:ff:ff:ff'
+  $PROG --nb ./pod1_ovnnb_db.db --sb ./pod1_ovnsb_db.db interactive
+
+  # IC per-node diffing:
+  $PROG --nb nodeA_ovnnb_db.db --sb nodeA_ovnsb_db.db dump ./dumpA
+  $PROG --nb nodeB_ovnnb_db.db --sb nodeB_ovnsb_db.db dump ./dumpB
+  $PROG compare ./dumpA ./dumpB
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Preflight — required host binaries.
+# ---------------------------------------------------------------------------
+require_binaries() {
+    local missing=0 b
+    for b in ovsdb-server ovsdb-tool ovs-appctl ovn-nbctl ovn-sbctl ovn-trace; do
+        if ! command -v "$b" >/dev/null 2>&1; then
+            err "required binary not found in PATH: $b"
+            missing=1
+        fi
+    done
+    if [ "$missing" -eq 1 ]; then
+        cat >&2 <<'EOF'
+
+Install the OVN + OVS packages, e.g.:
+  RHEL/Fedora/CentOS:  sudo dnf install -y openvswitch ovn ovn-central
+  Debian/Ubuntu:       sudo apt-get install -y openvswitch-common ovn-common ovn-central
+EOF
+        exit 127
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Prepare a servable copy of a DB file.
+#   - Copies the source read-only file into RUNDIR (never mutate the evidence).
+#   - Converts clustered/Raft DBs to standalone so a lone ovsdb-server can
+#     serve them without trying to form/join a Raft cluster.
+# Echoes the path to the servable copy.
+#   $1 = source db path   $2 = short name (nb|sb)
+# ---------------------------------------------------------------------------
+prepare_db() {
+    local src="$1" name="$2"
+    local work="$RUNDIR/${name}.db"
+
+    cp -- "$src" "$work"
+    chmod u+rw "$work"
+
+    if ovsdb-tool db-is-clustered "$work" 2>/dev/null; then
+        vlog "$name DB is clustered (Raft); converting to standalone"
+        local standalone="$RUNDIR/${name}-standalone.db"
+        ovsdb-tool cluster-to-standalone "$standalone" "$work" \
+            || die "failed to convert clustered $name DB to standalone"
+        mv -f -- "$standalone" "$work"
+    else
+        vlog "$name DB is standalone; serving as-is"
+    fi
+
+    # Sanity: make sure the file is a parseable OVSDB before we serve it.
+    ovsdb-tool db-name "$work" >/dev/null 2>&1 \
+        || die "$src does not look like a valid OVSDB file"
+
+    printf '%s' "$work"
+}
+
+# ---------------------------------------------------------------------------
+# Start a detached ovsdb-server for a prepared DB on a unix socket.
+#   $1 = servable db path   $2 = short name (nb|sb)   $3 = socket path
+# Records the daemon PID in SERVER_PIDS.
+# ---------------------------------------------------------------------------
+start_server() {
+    local db="$1" name="$2" sock="$3"
+    local pidfile="$RUNDIR/${name}.pid"
+    local logfile="$RUNDIR/${name}.log"
+    local ctl="$RUNDIR/${name}.ctl"
+    # Expose the control socket so ovs-appctl can target this server.
+    case "$name" in nb) NB_CTL="$ctl" ;; sb) SB_CTL="$ctl" ;; esac
+
+    vlog "starting ovsdb-server for $name on unix:$sock"
+    ovsdb-server "$db" \
+        --detach --no-chdir \
+        --pidfile="$pidfile" \
+        --unixctl="$ctl" \
+        --remote="punix:$sock" \
+        --log-file="$logfile" \
+        >/dev/null 2>&1 \
+        || die "ovsdb-server failed to start for $name (see $logfile)"
+
+    # Wait for the socket to accept connections (or the pidfile to appear).
+    local waited=0
+    while [ ! -S "$sock" ] && [ "$waited" -lt 100 ]; do
+        sleep 0.05; waited=$((waited + 1))
+    done
+    [ -S "$sock" ] || die "$name ovsdb-server socket never appeared: $sock"
+
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] || die "$name ovsdb-server pidfile empty: $pidfile"
+    SERVER_PIDS+=("$pid")
+    vlog "$name ovsdb-server running pid=$pid"
+}
+
+# ---------------------------------------------------------------------------
+# Bring up both transient servers and export the OVN_*_DB environment.
+# ---------------------------------------------------------------------------
+bootstrap_runtime() {
+    RUNDIR="$(mktemp -d "/tmp/${PROG}.XXXXXX")"
+    vlog "runtime dir: $RUNDIR"
+
+    NB_SOCK="$RUNDIR/nb.sock"
+    SB_SOCK="$RUNDIR/sb.sock"
+
+    local nb_serve sb_serve
+    nb_serve="$(prepare_db "$NB_DB" nb)"
+    sb_serve="$(prepare_db "$SB_DB" sb)"
+
+    start_server "$nb_serve" nb "$NB_SOCK"
+    start_server "$sb_serve" sb "$SB_SOCK"
+
+    # These are what ovn-nbctl/ovn-sbctl/ovn-trace read to find the DBs.
+    export OVN_NB_DB="unix:$NB_SOCK"
+    export OVN_SB_DB="unix:$SB_SOCK"
+    vlog "OVN_NB_DB=$OVN_NB_DB"
+    vlog "OVN_SB_DB=$OVN_SB_DB"
+}
+
+# ---------------------------------------------------------------------------
+# dump / compare — IC-aware per-node snapshotting and side-by-side diffing.
+#
+# In OVN-Interconnect (OCP 4.14+/4.20) each node has its own NB/SB DB. Some
+# state is synced cluster-wide and MUST match across nodes (ACLs, address sets,
+# port groups, load balancers, the chassis inventory); other state is inherently
+# per-node (GR_<node> routers, local switches, local vs remote port bindings).
+# 'dump' normalizes a node into stable files; 'compare' diffs two dumps and
+# flags drift in the invariant tables separately from expected per-node deltas.
+# ---------------------------------------------------------------------------
+
+# Tables captured per dump.  Format: "Table:col1,col2,...".
+NB_DUMP_TABLES=(
+    "Logical_Switch:name"
+    "Logical_Router:name"
+    "Logical_Switch_Port:name,type,addresses"
+    "Logical_Router_Port:name,mac,networks"
+    "ACL:direction,priority,match,action"
+    "Address_Set:name,addresses"
+    "Port_Group:name"
+    "Load_Balancer:name,protocol,vips"
+    "NAT:type,external_ip,logical_ip"
+)
+SB_DUMP_TABLES=(
+    "Chassis:hostname"
+    "Port_Binding:logical_port,type"
+    "Datapath_Binding:external_ids"
+    "Load_Balancer:name,vips"
+)
+
+# Files that OVN-K IC keeps identical on EVERY node — drift here is a real red
+# flag (broken NB->SB sync / partial rollout). Deliberately narrow:
+#   - Address_Set / Port_Group : cluster-global (namespaces, network policy).
+#   - Chassis                  : every node knows the full chassis inventory.
+# ACL and Load_Balancer are NOT listed: in IC they legitimately carry node-local
+# entries (per-node mgmt-port ACLs, host-networked / node-port service LBs), so
+# they differ between nodes by design and are reported as per-node, not drift.
+IC_INVARIANT_FILES=" nb.Address_Set.csv nb.Port_Group.csv sb.Chassis.csv "
+
+# Replace volatile UUIDs so diffs reflect real config drift, not row churn.
+scrub() {
+    sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<uuid>/g'
+}
+
+# Derive a short node label from the NB filename (…ovnkube-node-XXXX…).
+label_from_nb() {
+    basename "$1" | sed -E 's/_?ovnnb(_db)?\.db$//; s/\.db$//'
+}
+
+# Dump one table to a normalized, scrubbed, sorted CSV.
+#   $1=ctl binary  $2=db conn  $3=Table  $4=columns  $5=outfile
+dump_table() {
+    "$1" --db="$2" -f csv --no-headings --columns="$4" list "$3" 2>/dev/null \
+        | scrub | LC_ALL=C sort > "$5" || : > "$5"
+}
+
+do_dump() {
+    local outdir="${1:-./ovn-dump-$(label_from_nb "$NB_DB")}"
+    mkdir -p "$outdir"
+    outdir="$(cd "$outdir" && pwd)"
+    log "dumping $(label_from_nb "$NB_DB") -> $outdir"
+
+    {
+        echo "label: $(label_from_nb "$NB_DB")"
+        echo "nb: $NB_DB"
+        echo "sb: $SB_DB"
+        echo "generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "host_ovn: $(ovn-nbctl --version | head -1)"
+    } > "$outdir/manifest.txt"
+
+    # Human-readable, scrubbed topology snapshots for eyeballing.
+    ovn-nbctl --db="$OVN_NB_DB" show 2>/dev/null | scrub > "$outdir/nb-show.txt" || : > "$outdir/nb-show.txt"
+    ovn-sbctl --db="$OVN_SB_DB" show 2>/dev/null | scrub > "$outdir/sb-show.txt" || : > "$outdir/sb-show.txt"
+    # Logical flows are per-datapath (node-specific); store the count, not the body.
+    ovn-sbctl --db="$OVN_SB_DB" lflow-list 2>/dev/null | grep -c 'table=' \
+        > "$outdir/sb-lflow-count.txt" 2>/dev/null || echo 0 > "$outdir/sb-lflow-count.txt"
+
+    local entry tbl cols
+    for entry in "${NB_DUMP_TABLES[@]}"; do
+        tbl="${entry%%:*}"; cols="${entry#*:}"
+        dump_table ovn-nbctl "$OVN_NB_DB" "$tbl" "$cols" "$outdir/nb.$tbl.csv"
+    done
+    for entry in "${SB_DUMP_TABLES[@]}"; do
+        tbl="${entry%%:*}"; cols="${entry#*:}"
+        dump_table ovn-sbctl "$OVN_SB_DB" "$tbl" "$cols" "$outdir/sb.$tbl.csv"
+    done
+
+    log "dump complete: $(find "$outdir" -maxdepth 1 -type f | wc -l) files"
+    printf '%s\n' "$outdir"
+}
+
+# compare <dumpdirA> <dumpdirB> — fully offline, no DBs/servers/OVN binaries.
+do_compare() {
+    local a="${1:-}" b="${2:-}"
+    { [ -n "$a" ] && [ -n "$b" ]; } || { usage; die "compare needs two dump dirs: compare <dirA> <dirB>"; }
+    [ -d "$a" ] || die "not a directory: $a"
+    [ -d "$b" ] || die "not a directory: $b"
+    command -v diff >/dev/null 2>&1 || die "'diff' not found in PATH"
+    a="$(cd "$a" && pwd)"; b="$(cd "$b" && pwd)"
+
+    local la lb
+    la="$(sed -n 's/^label: //p' "$a/manifest.txt" 2>/dev/null || true)"; la="${la:-$(basename "$a")}"
+    lb="$(sed -n 's/^label: //p' "$b/manifest.txt" 2>/dev/null || true)"; lb="${lb:-$(basename "$b")}"
+
+    printf '\n=== IC consistency compare ===\n A: %-14s %s\n B: %-14s %s\n\n' "$la" "$a" "$lb" "$b"
+
+    local files
+    files="$( { (cd "$a" && ls ./*.csv 2>/dev/null); (cd "$b" && ls ./*.csv 2>/dev/null); } \
+               | sed 's#^\./##' | LC_ALL=C sort -u )"
+
+    printf '%-26s %-10s %s\n' "ARTIFACT" "CLASS" "RESULT"
+    printf '%-26s %-10s %s\n' "--------------------------" "----------" "------"
+
+    local f cls diffs_found=0 inv_diffs=0
+    for f in $files; do
+        cls="per-node"
+        case "$IC_INVARIANT_FILES" in *" $f "*) cls="INVARIANT";; esac
+        if [ ! -f "$a/$f" ]; then printf '%-26s %-10s %s\n' "$f" "$cls" "only in B"; diffs_found=1; [ "$cls" = INVARIANT ] && inv_diffs=1; continue; fi
+        if [ ! -f "$b/$f" ]; then printf '%-26s %-10s %s\n' "$f" "$cls" "only in A"; diffs_found=1; [ "$cls" = INVARIANT ] && inv_diffs=1; continue; fi
+        if diff -q "$a/$f" "$b/$f" >/dev/null 2>&1; then
+            printf '%-26s %-10s SAME (%s lines)\n' "$f" "$cls" "$(wc -l < "$a/$f" | tr -d ' ')"
+        else
+            local na nbb; na="$(wc -l < "$a/$f" | tr -d ' ')"; nbb="$(wc -l < "$b/$f" | tr -d ' ')"
+            diffs_found=1
+            if [ "$cls" = INVARIANT ]; then
+                inv_diffs=1
+                printf '%-26s %-10s DIFFER (A:%s B:%s)  <== IC DRIFT\n' "$f" "$cls" "$na" "$nbb"
+            else
+                printf '%-26s %-10s DIFFER (A:%s B:%s)  (expected)\n' "$f" "$cls" "$na" "$nbb"
+            fi
+        fi
+    done
+
+    if [ "$inv_diffs" -eq 1 ]; then
+        printf '\n--- INVARIANT drift detail (these should be identical across IC nodes) ---\n'
+        printf '    < = %s      > = %s\n' "$la" "$lb"
+        for f in $files; do
+            case "$IC_INVARIANT_FILES" in *" $f "*) ;; *) continue;; esac
+            [ -f "$a/$f" ] && [ -f "$b/$f" ] || continue
+            diff -q "$a/$f" "$b/$f" >/dev/null 2>&1 && continue
+            printf '\n### %s\n' "$f"
+            diff "$a/$f" "$b/$f" || true
+        done
+    fi
+
+    printf '\nSummary: '
+    if [ "$inv_diffs" -eq 1 ]; then
+        printf 'IC DRIFT DETECTED in cluster-synced tables — investigate.\n'; return 2
+    elif [ "$diffs_found" -eq 1 ]; then
+        printf 'invariant tables consistent; only per-node differences (expected in IC).\n'; return 0
+    else
+        printf 'dumps identical.\n'; return 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Preflight checklist — verify the --nb and --sb files form a VALID same-node
+# IC pair before running anything against them. Catches two common mistakes:
+#   1. Wrong file in a slot (e.g. an SB db passed to --nb)  -> schema check.
+#   2. NB and SB taken from DIFFERENT ovnkube-node pods     -> node-name check.
+#
+# Node identity is northd's canonical marker, present in BOTH databases:
+#   NB: NB_Global.options:name   SB: SB_Global.options:name  (== node hostname)
+# ---------------------------------------------------------------------------
+pf_line() { printf '  [%-4s] %s\n' "$1" "$2" >&2; }   # $1=PASS/FAIL/WARN $2=text
+
+unquote() { sed -e 's/^"//' -e 's/"$//'; }
+
+get_node_name() {
+    case "$1" in
+        nb) ovn-nbctl --db="$OVN_NB_DB" get NB_Global . options:name 2>/dev/null | unquote ;;
+        sb) ovn-sbctl --db="$OVN_SB_DB" get SB_Global . options:name 2>/dev/null | unquote ;;
+    esac
+}
+
+# Runs the checklist. $1=1 forces the full list even when everything passes.
+# Returns 0 if the pair is valid, 1 otherwise. All output goes to stderr.
+run_preflight() {
+    local force_full="${1:-0}"
+    local rc=0
+    local nb_schema sb_schema nb_node sb_node
+    local -a lines=()
+
+    nb_schema="$(ovsdb-tool db-name "$NB_DB" 2>/dev/null || true)"
+    if [ "$nb_schema" = "OVN_Northbound" ]; then
+        lines+=("PASS|--nb is an OVN_Northbound database")
+    else
+        lines+=("FAIL|--nb is NOT an OVN_Northbound DB (schema: ${nb_schema:-unreadable})")
+        rc=1
+    fi
+
+    sb_schema="$(ovsdb-tool db-name "$SB_DB" 2>/dev/null || true)"
+    if [ "$sb_schema" = "OVN_Southbound" ]; then
+        lines+=("PASS|--sb is an OVN_Southbound database")
+    else
+        lines+=("FAIL|--sb is NOT an OVN_Southbound DB (schema: ${sb_schema:-unreadable})")
+        rc=1
+    fi
+
+    nb_node="$(get_node_name nb)"
+    sb_node="$(get_node_name sb)"
+
+    if [ -z "$nb_node" ] || [ -z "$sb_node" ]; then
+        lines+=("WARN|could not read node name (NB:'${nb_node:-?}' SB:'${sb_node:-?}') — skipping identity check")
+    elif [ "$nb_node" = "$sb_node" ]; then
+        lines+=("PASS|NB and SB belong to the SAME node: $nb_node")
+    else
+        lines+=("FAIL|NB and SB belong to DIFFERENT ovnkube-node pods:")
+        lines+=("FAIL|    NB (--nb) node: $nb_node")
+        lines+=("FAIL|    SB (--sb) node: $sb_node")
+        rc=1
+    fi
+
+    # Quiet on full success unless asked; always show when something failed.
+    if [ "$rc" -ne 0 ] || [ "$force_full" -eq 1 ] || [ "$VERBOSE" -eq 1 ]; then
+        printf '\n[%s] IC NB/SB pairing checklist:\n' "$PROG" >&2
+        local entry
+        for entry in "${lines[@]}"; do
+            pf_line "${entry%%|*}" "${entry#*|}"
+        done
+        printf '\n' >&2
+    else
+        log "IC pairing OK: node $nb_node"
+    fi
+
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# appctl — run ovs-appctl against a transient ovsdb-server's control socket.
+# The unixctl sockets live inside the ephemeral runtime dir, so ovs-appctl has
+# no way to find them on its own; this wires -t to the right one.
+#   appctl nb <ovs-appctl args...>   e.g. appctl nb memory/show
+#   appctl sb <ovs-appctl args...>   e.g. appctl sb ovsdb-server/list-dbs
+# Handy commands: list-commands | memory/show | ovsdb-server/list-dbs |
+#   ovsdb-server/compact | ovsdb-server/get-db-storage-status OVN_Northbound
+# ---------------------------------------------------------------------------
+do_appctl() {
+    local which="${1:-}"; shift || true
+    local target
+    case "$which" in
+        nb) target="$NB_CTL" ;;
+        sb) target="$SB_CTL" ;;
+        *)  die "usage: appctl <nb|sb> <ovs-appctl args...>  (e.g. appctl nb memory/show)" ;;
+    esac
+    [ -n "$target" ] || die "control socket for '$which' not available"
+    [ "$#" -ge 1 ] || die "appctl needs a command, e.g. appctl $which ovsdb-server/list-dbs"
+    ovs-appctl -t "$target" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Command dispatch
+# ---------------------------------------------------------------------------
+run_command() {
+    local cmd="$1"; shift || true
+    # NOTE: never 'exec' here — that would replace this shell and the EXIT
+    # trap would never run, orphaning the detached ovsdb-server daemons.
+    # Run in-process, capture the status, and let cleanup() fire on return.
+    local rc=0
+    case "$cmd" in
+        nbctl)
+            ovn-nbctl --db="$OVN_NB_DB" "$@" || rc=$?
+            ;;
+        sbctl)
+            ovn-sbctl --db="$OVN_SB_DB" "$@" || rc=$?
+            ;;
+        trace)
+            # ovn-trace reads the Southbound DB.
+            ovn-trace --db="$OVN_SB_DB" "$@" || rc=$?
+            ;;
+        dump)
+            do_dump "$@" || rc=$?
+            ;;
+        appctl)
+            do_appctl "$@" || rc=$?
+            ;;
+        interactive)
+            start_interactive || rc=$?
+            ;;
+        *)
+            die "unknown command: '$cmd' (try: nbctl | sbctl | trace | appctl | dump | compare | check | interactive)"
+            ;;
+    esac
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Interactive subshell: hands the operator a shell where OVN_NB_DB/OVN_SB_DB
+# already point at the transient sockets, so plain ovn-nbctl / ovn-sbctl /
+# ovn-trace commands "just work" for a multi-command session.
+# Cleanup still runs when the subshell exits (parent EXIT trap fires).
+# ---------------------------------------------------------------------------
+start_interactive() {
+    local rcfile="$RUNDIR/interactive.bashrc"
+    cat > "$rcfile" <<EOF
+# transient rc for ovn-analyzer interactive session
+[ -f /etc/bashrc ] && . /etc/bashrc
+[ -f "\$HOME/.bashrc" ] && . "\$HOME/.bashrc"
+export OVN_NB_DB="$OVN_NB_DB"
+export OVN_SB_DB="$OVN_SB_DB"
+export OVN_NB_CTL="$NB_CTL"
+export OVN_SB_CTL="$SB_CTL"
+export PS1='(ovn-analyzer) \w \$ '
+alias nbctl='ovn-nbctl'
+alias sbctl='ovn-sbctl'
+alias trace='ovn-trace'
+alias appctl-nb='ovs-appctl -t "\$OVN_NB_CTL"'
+alias appctl-sb='ovs-appctl -t "\$OVN_SB_CTL"'
+cat <<'BANNER'
+-----------------------------------------------------------------
+ ovn-analyzer interactive session
+   OVN_NB_DB  -> $OVN_NB_DB
+   OVN_SB_DB  -> $OVN_SB_DB
+   OVN_NB_CTL -> $NB_CTL   (ovs-appctl control socket)
+   OVN_SB_CTL -> $SB_CTL
+ Use: ovn-nbctl show | ovn-sbctl lflow-list | ovn-trace ...
+ Aliases: nbctl / sbctl / trace
+          appctl-nb <cmd>   e.g. appctl-nb memory/show
+          appctl-sb <cmd>   e.g. appctl-sb ovsdb-server/list-dbs
+ Type 'exit' to tear down the transient servers and clean up.
+-----------------------------------------------------------------
+BANNER
+EOF
+
+    log "entering interactive subshell (type 'exit' to clean up)"
+    # --norc so only our rcfile applies; --noprofile keeps it deterministic.
+    # '|| true' so a non-zero exit from the subshell still runs cleanup cleanly.
+    bash --noprofile --rcfile "$rcfile" -i || true
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    local -a positional=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --nb)      NB_DB="${2:-}"; shift 2 || die "--nb requires a path" ;;
+            --nb=*)    NB_DB="${1#*=}"; shift ;;
+            --sb)      SB_DB="${2:-}"; shift 2 || die "--sb requires a path" ;;
+            --sb=*)    SB_DB="${1#*=}"; shift ;;
+            --keep)    KEEP_RUNDIR=1; shift ;;
+            --force)   FORCE=1; shift ;;
+            -v|--verbose) VERBOSE=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            --)        shift; positional+=("$@"); break ;;
+            -*)        die "unknown option: $1 (see --help)" ;;
+            *)         positional+=("$@"); break ;;   # first non-opt = command
+        esac
+    done
+    set -- "${positional[@]:-}"
+
+    [ "$#" -ge 1 ] || { usage; die "no command given"; }
+
+    # --nb/--sb are validated per-command in main() (compare needs neither).
+    # Resolve any provided paths to absolute (we may chdir / subshell later).
+    if [ -n "$NB_DB" ]; then
+        [ -f "$NB_DB" ] || die "NB DB file not found: $NB_DB"
+        NB_DB="$(cd "$(dirname "$NB_DB")" && pwd)/$(basename "$NB_DB")"
+    fi
+    if [ -n "$SB_DB" ]; then
+        [ -f "$SB_DB" ] || die "SB DB file not found: $SB_DB"
+        SB_DB="$(cd "$(dirname "$SB_DB")" && pwd)/$(basename "$SB_DB")"
+    fi
+
+    ARGV=("$@")
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+    declare -ga ARGV=()
+    parse_args "$@"
+
+    local cmd="${ARGV[0]:-}"
+
+    # 'compare' is fully offline: it diffs two existing dumps and needs no
+    # DB files, no transient servers, and no OVN binaries.
+    if [ "$cmd" = "compare" ]; then
+        local rc=0
+        do_compare "${ARGV[@]:1}" || rc=$?
+        exit "$rc"
+    fi
+
+    # All other commands need a live NB/SB pair served by transient servers.
+    [ -n "$NB_DB" ] || { usage; die "--nb is required for '$cmd'"; }
+    [ -n "$SB_DB" ] || { usage; die "--sb is required for '$cmd'"; }
+
+    require_binaries
+
+    # Arm cleanup BEFORE we create anything that needs tearing down.
+    # PIPE/QUIT included so a closed downstream pipe or Ctrl-\ still tears down.
+    trap cleanup EXIT INT TERM HUP PIPE QUIT
+
+    bootstrap_runtime
+
+    # Verify the NB/SB pair before touching it. 'check' shows the full list.
+    local pf_rc=0
+    run_preflight "$([ "$cmd" = "check" ] && echo 1 || echo 0)" || pf_rc=$?
+
+    if [ "$cmd" = "check" ]; then
+        exit "$pf_rc"       # 'check' IS the checklist; nothing else to run
+    fi
+
+    if [ "$pf_rc" -ne 0 ]; then
+        if [ "$FORCE" -eq 1 ]; then
+            log "checklist FAILED — continuing anyway (--force)"
+        else
+            die "NB/SB failed the IC pairing checklist above; refusing to run. Pass --force to override."
+        fi
+    fi
+
+    local rc=0
+    run_command "${ARGV[@]}" || rc=$?
+    exit "$rc"   # triggers the EXIT trap -> cleanup, preserving the status
+}
+
+main "$@"
