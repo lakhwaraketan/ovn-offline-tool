@@ -261,27 +261,17 @@ routes through `ovn_cluster_router`, and leaves via the `transit_switch` toward
 > the captured DB schema. Match the host OVN version to the cluster's to silence
 > them.
 
-## 4. Control socket (`appctl`)
-
-```bash
-$OVN appctl nb ovsdb-server/list-dbs
-$OVN appctl sb memory/show
-$OVN appctl nb ovsdb-server/get-db-storage-status OVN_Northbound
-$OVN appctl nb list-commands
-```
-
-## 5. Interactive session
+## 4. Interactive session
 
 ```bash
 $OVN interactive
-# inside the subshell OVN_NB_DB / OVN_SB_DB / OVN_NB_CTL / OVN_SB_CTL are set:
+# inside the subshell OVN_NB_DB / OVN_SB_DB are set:
 #   ovn-nbctl show
 #   ovn-sbctl lflow-list
-#   appctl-nb memory/show
 #   exit          # tears down the transient servers
 ```
 
-## 6. Per-node IC dump & compare
+## 5. Per-node IC dump & compare
 
 ```bash
 # snapshot two nodes
